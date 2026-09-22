@@ -192,3 +192,90 @@ def test_full_export_includes_audit():
     wid = r.json()["workbook_id"]
     d = client.get(f"/api/workbooks/{wid}/export").json()
     assert "audit" in d and "issues" in d["audit"]
+
+
+def make_names_xlsx() -> bytes:
+    from openpyxl.workbook.defined_name import DefinedName
+    wb = Workbook()
+    p = wb.active
+    p.title = "参数"
+    p["B2"] = 9
+    c = wb.create_sheet("计算")
+    c["B1"] = "=折扣率*2"          # 工作簿级名称 -> 参数!B2
+    c["B2"] = "=幽灵名称"          # 未定义名称
+    wb.defined_names["折扣率"] = DefinedName("折扣率", attr_text="参数!$B$2")
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_upload_reports_defined_name_counts():
+    r = client.post("/api/upload", files={"file": ("n.xlsx", make_names_xlsx(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    d = r.json()
+    assert d["defined_name_count"] == 1
+    assert d["workbook_scoped_count"] == 1 and d["sheet_scoped_count"] == 0
+    assert d["name_usage_count"] == 2
+
+
+def test_cells_searchable_by_name_and_definition():
+    wid = client.post("/api/upload", files={"file": ("n.xlsx", make_names_xlsx(),
+                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
+                      ).json()["workbook_id"]
+    r = client.get(f"/api/workbooks/{wid}/cells", params={"q": "折扣率"})
+    cells = {c["cell"] for c in r.json()["cells"]}
+    assert "计算!B1" in cells
+    r = client.get(f"/api/workbooks/{wid}/cells", params={"q": "$B$2"})
+    assert "计算!B1" in {c["cell"] for c in r.json()["cells"]}
+    # 单元格行携带名称留痕
+    row = next(c for c in client.get(f"/api/workbooks/{wid}/cells",
+                                     params={"q": "折扣率"}).json()["cells"]
+               if c["cell"] == "计算!B1")
+    assert row["names"][0]["name"] == "折扣率"
+    assert row["names"][0]["status"] == "resolved"
+
+
+def test_impact_through_name_and_root_names_field():
+    wid = client.post("/api/upload", files={"file": ("n.xlsx", make_names_xlsx(),
+                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
+                      ).json()["workbook_id"]
+    # 下游：参数!B2 经名称影响 计算!B1
+    r = client.get(f"/api/workbooks/{wid}/impact", params={"cell": "参数!B2"})
+    assert "计算!B1" in {i["cell"] for i in r.json()["impacted"]}
+    # 上游 + 根名称字段
+    r = client.get(f"/api/workbooks/{wid}/impact",
+                   params={"cell": "计算!B1", "direction": "upstream"})
+    d = r.json()
+    assert "参数!B2" in {i["cell"] for i in d["impacted"]}
+    assert d["root_names"][0]["name"] == "折扣率"
+    assert d["root_names"][0]["definition"] == "参数!$B$2"
+
+
+def test_audit_export_includes_name_inventory_and_usages():
+    wid = client.post("/api/upload", files={"file": ("n.xlsx", make_names_xlsx(),
+                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
+                      ).json()["workbook_id"]
+    d = client.get(f"/api/workbooks/{wid}/audit/export").json()
+    names = {n["name"]: n for n in d["defined_names"]}
+    assert "折扣率" in names and names["折扣率"]["definition"] == "参数!$B$2"
+    statuses = {u["ref_text"]: u["status"] for u in d["name_usages"]}
+    assert statuses["折扣率"] == "resolved"
+    assert statuses["幽灵名称"] == "undefined"
+    # 完整导出同样保留名称
+    ex = client.get(f"/api/workbooks/{wid}/export").json()
+    assert "defined_names" in ex and "name_usages" in ex
+    assert ex["formulas"]["计算!B2"]["names"][0]["status"] == "undefined"
+
+
+def test_audit_undefined_name_endpoint():
+    wid = client.post("/api/upload", files={"file": ("n.xlsx", make_names_xlsx(),
+                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
+                      ).json()["workbook_id"]
+    d = client.get(f"/api/workbooks/{wid}/audit").json()
+    und = next(i for i in d["issues"] if i["code"] == "undefined_name")
+    assert und["level"] == "error" and und["cell"] == "计算!B2"
+    assert und["evidence"][0]["to_display"] == "幽灵名称"
+    # error 级别筛选只含名称错误（该工作簿无缺失工作表）
+    errs = client.get(f"/api/workbooks/{wid}/audit",
+                      params={"level": "error"}).json()["issues"]
+    assert {i["code"] for i in errs} == {"undefined_name"}

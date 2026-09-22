@@ -114,6 +114,7 @@ def workbook_impact(
     result["root_formula"] = graph.formulas.get(node)
     result["root_value"] = graph.values.get(node)
     result["root_in_cycle"] = node in graph.cycle_nodes
+    result["root_names"] = graph._names_of(node)
     return result
 
 
@@ -161,10 +162,13 @@ def workbook_audit(
 @app.get("/api/workbooks/{wid}/audit/export")
 def workbook_audit_export(wid: str):
     entry = _get(wid)
+    g = entry["graph"]
     payload = {
         "workbook_id": wid,
         "filename": entry["filename"],
-        "audit": entry["graph"].audit(evidence_limit=None),
+        "defined_names": g.name_inventory_json(),
+        "name_usages": g.name_usages_json(),
+        "audit": g.audit(evidence_limit=None),
     }
     return JSONResponse(
         payload,

@@ -48,6 +48,16 @@
            margin-left: 6px; vertical-align: 1px; }
   .badge.cycle { background: #7f1d1d; color: #fecaca; }
   .badge.n { background: var(--chip); color: var(--muted); }
+  .badge.nm { background: #1e3a5f; color: #bfdbfe; font-family: ui-monospace, Consolas, monospace; }
+  .badge.nm.error { background: #7f1d1d; color: #fecaca; }
+  .badge.nm.warning { background: #78350f; color: #fde68a; }
+  .name-line { font-size: 11px; color: var(--muted); margin-top: 3px;
+      font-family: ui-monospace, Consolas, monospace;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .name-line .nm-status { color: #60a5fa; }
+  .name-line .nm-status.error { color: var(--warn); }
+  .name-line .nm-status.warning { color: #fbbf24; }
+  .name-line .nm-status.constant { color: var(--accent2); }
   #detail { flex: 1; overflow-y: auto; padding: 18px 22px; }
   #empty { color: var(--muted); text-align: center; margin-top: 120px; line-height: 2; }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
@@ -116,6 +126,7 @@
   <span class="stat">工作表<b id="stSheets"></b></span>
   <span class="stat">公式单元格<b id="stFormulas"></b></span>
   <span class="stat">依赖边<b id="stEdges"></b></span>
+  <span class="stat">定义名称<b id="stNames"></b></span>
   <span class="stat cycles">循环引用<b id="stCycles"></b></span>
   <span class="stat cycles">审计问题<b id="stAudit">—</b></span>
 </div>
@@ -144,8 +155,8 @@
         <div class="filters-row">
           <select id="auditLevel">
             <option value="">全部级别</option>
-            <option value="error">错误（缺失工作表）</option>
-            <option value="warning">警告（空引用 / 越界 / 高扇出）</option>
+            <option value="error">错误（缺失工作表 / 名称未定义或失效）</option>
+            <option value="warning">警告（空引用 / 越界 / 外部名称 / 高扇出）</option>
             <option value="info">提示（孤立公式）</option>
           </select>
           <select id="auditSheet"><option value="">全部工作表</option></select>
@@ -174,6 +185,7 @@
         <div style="margin-top:8px" class="formula-code" id="dFormula"></div>
         <div style="margin-top:8px" class="muted">缓存值：<span id="dValue" class="mono"></span>
           <span id="dCycleBadge"></span></div>
+        <div id="dNames" style="margin-top:8px"></div>
       </div>
       <div class="tabs">
         <button class="tab active" data-dir="downstream">下游影响（谁受它影响）</button>
@@ -201,10 +213,21 @@ let WID = null, CURRENT = null, DIRECTION = 'downstream', AUDIT_SUMMARY = null;
 const LEVEL_LABEL = { error: '错误', warning: '警告', info: '提示' };
 const CODE_LABEL = {
   missing_sheet: '工作表不存在',
+  undefined_name: '名称未定义',
+  invalid_name: '名称目标失效',
+  external_name: '外部名称',
   empty_ref: '引用了空单元格',
   out_of_range: '引用超出已用范围',
   high_fanout: '扇出过大',
   orphan_formula: '孤立公式',
+};
+const NAME_STATUS_LABEL = {
+  resolved: '已解析', constant: '常量', formula: '公式',
+  undefined: '未定义', invalid: '目标无效', external: '外部引用',
+};
+const NAME_STATUS_CLASS = {
+  resolved: '', constant: 'constant', formula: '',
+  undefined: 'error', invalid: 'error', external: 'warning',
 };
 const $ = id => document.getElementById(id);
 
@@ -214,6 +237,28 @@ function toast(msg) {
 }
 const esc = s => String(s ?? '').replace(/[&<>"']/g,
   c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+// 名称使用留痕：名称（状态·目标数）+ 定义/作用域提示
+function nameBadge(n) {
+  const cls = NAME_STATUS_CLASS[n.status] || '';
+  const label = NAME_STATUS_LABEL[n.status] || n.status;
+  return `<span class="badge nm ${cls}" title="${esc((n.scope||'') + ' ' + (n.definition||''))}">名·${esc(label)}</span>`;
+}
+function nameLines(names) {
+  if (!names || !names.length) return '';
+  return names.slice(0, 3).map(n => {
+    const cls = NAME_STATUS_CLASS[n.status] || '';
+    const label = NAME_STATUS_LABEL[n.status] || n.status;
+    const scope = n.scope ? `［${esc(n.scope)}］` : '';
+    const tgt = n.target_count > 0 ? ` → ${n.target_count} 个单元格` : '';
+    const def = n.definition ? ` = ${esc(n.definition)}` : '';
+    return `<div class="name-line" title="${esc(n.definition||'')}">🔖 ${esc(n.name_display)} ` +
+      `<span class="nm-status ${cls}">${esc(label)}</span>${esc(scope)}${esc(tgt)}${esc(def)}</div>`;
+  }).join('') + (names.length > 3 ? `<div class="name-line">…另有 ${names.length - 3} 个名称</div>` : '');
+}
+function hasNameError(names) {
+  return (names || []).some(n => ['undefined','invalid'].includes(n.status));
+}
 
 // ---------------- 上传 ----------------
 $('uploadBtn').onclick = () => $('fileInput').click();
@@ -252,6 +297,9 @@ function onUploaded(d) {
   $('stSheets').textContent = d.sheets.length;
   $('stFormulas').textContent = d.formula_count;
   $('stEdges').textContent = d.edge_count;
+  $('stNames').textContent = (d.defined_name_count || 0) +
+    '（工作簿级 ' + (d.workbook_scoped_count || 0) + ' / 工作表级 ' +
+    (d.sheet_scoped_count || 0) + '）';
   $('stCycles').textContent = d.cycle_count;
   $('exportBtn').disabled = false;
   $('auditBtn').disabled = false;
@@ -297,8 +345,10 @@ async function loadCells() {
     <div class="cell-item" data-cell="${esc(c.cell)}">
       <div class="cid">${esc(c.display)}
         ${c.in_cycle ? '<span class="badge cycle">循环</span>' : ''}
+        ${(c.names||[]).length ? nameBadge(c.names.find(n=>hasNameError([n]))||c.names[0]) : ''}
         <span class="badge n">↓${c.dependent_count} ↑${c.precedent_count}</span></div>
       ${c.formula ? `<div class="cformula">${esc(c.formula)}</div>` : ''}
+      ${nameLines(c.names)}
     </div>`).join('') || '<div style="padding:20px;color:var(--muted)">无匹配单元格</div>';
 }
 
@@ -339,6 +389,9 @@ async function loadImpact(cell) {
   $('dFormula').textContent = d.root_formula || '（非公式单元格）';
   $('dValue').textContent = d.root_value ?? '—';
   $('dCycleBadge').innerHTML = d.root_in_cycle ? '<span class="badge cycle">处于循环引用中</span>' : '';
+  $('dNames').innerHTML = (d.root_names && d.root_names.length)
+    ? '<div class="muted" style="font-size:12px;margin-bottom:4px">公式中使用的定义名称：</div>' + nameLines(d.root_names)
+    : '';
   $('directTitle').textContent = DIRECTION === 'downstream'
     ? `直接受影响单元格（${d.direct.length}）` : `直接依赖的单元格（${d.direct.length}）`;
   $('impactTitle').textContent = DIRECTION === 'downstream'
@@ -395,8 +448,10 @@ function renderAuditSummary(d) {
   pill.className = d.total === 0 ? 'zero' : '';
   pill.style.display = 'inline-block';
   const codeNames = {
-    missing_sheet: '工作表不存在', empty_ref: '引用空单元格',
-    out_of_range: '越界引用', high_fanout: '高扇出', orphan_formula: '孤立公式',
+    missing_sheet: '工作表不存在', undefined_name: '名称未定义',
+    invalid_name: '名称目标失效', external_name: '外部名称',
+    empty_ref: '引用空单元格', out_of_range: '越界引用',
+    high_fanout: '高扇出', orphan_formula: '孤立公式',
   };
   $('auditCounts').innerHTML =
     `<span class="ac error">错误<b>${c.error}</b></span>` +
@@ -460,6 +515,11 @@ async function loadAudit() {
       <td>
         <div>${esc(it.message)}</div>
         ${it.target_display ? `<div class="path" style="margin:3px 0">目标：${esc(it.target_display)}</div>` : ''}
+        ${it.name_display ? `<div class="path" style="margin:3px 0">名称：${esc(it.name_display)}` +
+            (it.name_scope ? `（${esc(it.name_scope)}）` : '') +
+            (it.name_chain && it.name_chain.length > 1
+              ? `　解析链：${esc(it.name_chain.join(' -> '))}` : '') + `</div>` : ''}
+        ${it.name_definition ? `<div class="path" style="margin:3px 0">名称定义：${esc(it.name_definition)}</div>` : ''}
         ${it.formula ? `<div class="formula-code" style="margin:5px 0">${esc(it.formula)}</div>`
                      : ''}
         ${it.evidence.length || it.evidence_truncated ? renderEvidence(it) : ''}
