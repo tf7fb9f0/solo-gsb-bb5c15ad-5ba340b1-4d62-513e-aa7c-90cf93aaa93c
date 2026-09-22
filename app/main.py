@@ -24,7 +24,7 @@ MAX_WORKBOOKS = 5  # 内存中最多保留的工作簿数量，超出后淘汰�
 STATIC_DIR = Path(__file__).parent / "static"
 SAMPLES_DIR = Path(__file__).resolve().parent.parent / "samples"
 
-app = FastAPI(title="电子表格公式影响分析", version="1.1.0")
+app = FastAPI(title="电子表格公式影响分析", version="1.2.0")
 
 # wid -> {"graph": WorkbookGraph, "filename": str, "ts": float}
 _store: OrderedDict[str, dict] = OrderedDict()
@@ -165,6 +165,7 @@ def workbook_audit_export(wid: str):
         "workbook_id": wid,
         "filename": entry["filename"],
         "audit": entry["graph"].audit(evidence_limit=None),
+        "defined_names": entry["graph"].defined_names_export(),
     }
     return JSONResponse(
         payload,

@@ -1,12 +1,14 @@
-"""单元格依赖图：构图、循环引用检测、影响面/依赖链查询。"""
+"""单元格依赖图：构图（含名称管理器解析）、循环引用检测、影响面/依赖链查询。"""
 from __future__ import annotations
 
+import re
 from collections import deque
 from dataclasses import dataclass, field
 
 from openpyxl.utils import get_column_letter
+from openpyxl.workbook.defined_name import DefinedName
 
-from .formula_parser import RawRef, parse_formula
+from .formula_parser import RawName, RawRef, parse_formula, parse_formula_tokens
 
 # 单个区域最多展开的单元格数，防止 SUM(A:XFD) 之类打爆内存
 MAX_RANGE_CELLS = 5000
@@ -20,6 +22,17 @@ MAX_AUDIT_EVIDENCE = 100
 # 审计问题级别 -> 排序权重（越严重越靠前）
 SEVERITY_WEIGHT = {"error": 0, "warning": 1, "info": 2}
 AUDIT_LEVELS = ("error", "warning", "info")
+
+# 定义名称解析状态
+NAME_OK = "ok"                    # 成功解析到本工作簿的单元格 / 区域
+NAME_CONSTANT = "constant"        # 定义为常量 / 非引用公式，无依赖边
+NAME_UNDEFINED = "undefined"      # 按作用域找不到该名称
+NAME_BAD_TARGET = "bad_target"    # 定义目标损坏（#REF! / 外部工作簿 / 空定义）
+NAME_MISSING_SHEET = "missing_sheet"  # 目标指向不存在的工作表
+# 不会产生依赖边（即不进入影响面）的名称解析状态
+NAME_UNRESOLVED_STATES = frozenset(
+    {NAME_UNDEFINED, NAME_BAD_TARGET, NAME_MISSING_SHEET}
+)
 
 
 def node_id(sheet: str, coord: str) -> str:
@@ -48,6 +61,31 @@ class SheetInfo:
 
 
 @dataclass(frozen=True)
+class DefinedNameInfo:
+    """名称管理器中的一条定义名称。"""
+
+    name: str
+    scope: str | None               # None=工作簿级，否则为工作表名
+    target: str                     # 定义原文，如 参数!$B$2 / 3.14 / #REF!
+    status: str                     # ok / constant / bad_target / missing_sheet
+    refs: tuple[RawRef, ...]        # 目标解析出的引用（constant 为空元组）
+
+
+@dataclass(frozen=True)
+class NameUse:
+    """公式中的一次名称使用及其解析结果。"""
+
+    source: str                     # 公式单元格内部 id
+    formula: str                    # 公式原文
+    name: str                       # 名称本身
+    qualifier: str | None           # `工作表!名称` 中的限定工作表，None 为裸用
+    text: str                       # 公式中的原始记号，如 参数!税率
+    scope: str | None               # 解析命中的定义作用域；未解析为 None
+    target: str | None              # 命中的定义原文；未解析为 None
+    status: str                     # 解析状态，见 NAME_* 常量
+
+
+@dataclass(frozen=True)
 class MissingSheetRef:
     """跨表引用指向不存在的工作表（构图时直接跳过，只在此留证）。"""
 
@@ -68,6 +106,25 @@ class OutOfRangeRef:
     coord: str         # 第一个越界坐标（展示用），如 A99
 
 
+def _parse_target_refs(target: str) -> list[RawRef]:
+    """把名称管理器中名称的定义文本解析为引用列表。
+
+    仅当整个定义是**纯引用**（单元格 / 区域，或以逗号分隔的多个引用并集，
+    如 `参数!$B$2:B5`、`Sheet1!$A$1,Sheet1!$C$1`、整行整列）时返回 RawRef；
+    常量（`3.14`）或含运算的表达式（`A1+1`）返回空列表——这类名称不指向
+    确定的单元格 / 区域，不能展开为依赖边。
+    """
+    text = target[1:] if target.startswith("=") else target
+    tokens = parse_formula_tokens(text)
+    if not tokens or any(kind != "ref" for _, kind in tokens):
+        return []
+    refs = [r for r, _ in tokens]
+    compact = re.sub(r"\s+", "", text)
+    if ",".join(r.text for r in refs) != compact:
+        return []
+    return refs
+
+
 @dataclass
 class WorkbookGraph:
     sheets: list[SheetInfo] = field(default_factory=list)
@@ -80,6 +137,9 @@ class WorkbookGraph:
     edge_count: int = 0
     missing_sheet_refs: list[MissingSheetRef] = field(default_factory=list)
     out_of_range_refs: list[OutOfRangeRef] = field(default_factory=list)
+    # 名称管理器
+    defined_names: list[DefinedNameInfo] = field(default_factory=list)
+    name_uses: list[NameUse] = field(default_factory=list)
 
     # ------------------------------------------------------------------ 构图
     @classmethod
@@ -92,6 +152,10 @@ class WorkbookGraph:
 
         ws_values = {ws.title: ws for ws in wb_values.worksheets}
         sheet_names = set(bounds)
+
+        g._collect_defined_names(wb_formula, sheet_names)
+        global_names, local_names = g._name_indexes()
+        seen_name_uses: set[tuple] = set()
 
         for ws in wb_formula.worksheets:
             wsv = ws_values.get(ws.title)
@@ -109,33 +173,167 @@ class WorkbookGraph:
                         v = wsv[coord].value
                         if v is not None:
                             g.values[node] = str(v)
-                    for ref in parse_formula(formula):
-                        target_sheet = ref.sheet if ref.sheet is not None else ws.title
-                        if target_sheet not in sheet_names:
-                            g.missing_sheet_refs.append(
-                                MissingSheetRef(node, formula, target_sheet, ref.text)
-                            )
-                            continue  # 引用不存在的工作表，跳过
-                        wst = ws_values.get(target_sheet)
-                        coords, out_coord = g._expand(ref, bounds[target_sheet])
-                        if out_coord is not None:
-                            g.out_of_range_refs.append(
-                                OutOfRangeRef(node, formula, target_sheet,
-                                              ref.text, out_coord)
-                            )
-                        for tcoord in coords:
-                            tnode = node_id(target_sheet, tcoord)
-                            g.precedents.setdefault(node, set()).add(tnode)
-                            g.dependents.setdefault(tnode, set()).add(node)
-                            g.edge_count += 1
-                            # 叶子单元格也记录值，便于前端展示
-                            if tnode not in g.formulas and tnode not in g.values and wst is not None:
-                                v = wst[tcoord].value
-                                if v is not None:
-                                    g.values[tnode] = str(v)
+                    for token, kind in parse_formula_tokens(formula):
+                        if kind == "ref":
+                            g._link_ref(token, node, formula, ws.title,
+                                        bounds, sheet_names, ws_values)
+                        else:
+                            g._link_name(token, node, formula, ws.title,
+                                         bounds, sheet_names, ws_values,
+                                         global_names, local_names, seen_name_uses)
 
         g._detect_cycles()
         return g
+
+    # ---------------------------------------------------------- 名称管理器
+    def _collect_defined_names(self, wb_formula, sheet_names) -> None:
+        """读取工作簿级与工作表级定义名称，并预先解析其目标。
+
+        openpyxl 加载后：工作簿级名称在 wb.defined_names，工作表级名称在
+        ws.defined_names（localSheetId 指向该表）。
+        """
+        sheet_by_index = {i: ws.title for i, ws in enumerate(wb_formula.worksheets)}
+
+        def add(dn: DefinedName, scope: str | None) -> None:
+            raw = dn.attr_text if dn.attr_text is not None else dn.value
+            # openpyxl 在空定义时可能保留 None 或序列化为字面量 "none"
+            target = (raw or "").strip()
+            if not target or target.lower() == "none":
+                status, refs = NAME_BAD_TARGET, ()
+            elif "#REF!" in target.upper():
+                status, refs = NAME_BAD_TARGET, ()
+            elif target.lstrip().startswith("["):
+                # 外部工作簿引用 [Book.xlsx]Sheet!A1，本工作簿内无法定位
+                status, refs = NAME_BAD_TARGET, ()
+            else:
+                # 未限定工作表的相对引用：局部名称归属其作用域表，
+                # 工作簿级名称在实际使用时归属公式所在表（此处保留 None）。
+                default_sheet = scope
+                parsed = tuple(
+                    self._qualify_ref(r, default_sheet)
+                    for r in _parse_target_refs(target)
+                )
+                if not parsed:
+                    status = NAME_CONSTANT  # 常量或非引用公式（如 3.14 / A1+1）
+                elif any(r.sheet not in sheet_names for r in parsed):
+                    status = NAME_MISSING_SHEET
+                else:
+                    status = NAME_OK
+                refs = parsed
+            self.defined_names.append(
+                DefinedNameInfo(dn.name, scope, target, status, refs)
+            )
+
+        for dn in wb_formula.defined_names.values():
+            add(dn, None)
+        for ws in wb_formula.worksheets:
+            scope = ws.title
+            for dn in ws.defined_names.values():
+                # 防御：localSheetId 与所在表不一致时以 localSheetId 为准
+                if dn.localSheetId is not None and dn.localSheetId in sheet_by_index:
+                    scope = sheet_by_index[dn.localSheetId]
+                add(dn, scope)
+
+    def _name_indexes(
+        self,
+    ) -> tuple[dict[str, DefinedNameInfo], dict[str, dict[str, DefinedNameInfo]]]:
+        global_names: dict[str, DefinedNameInfo] = {}
+        local_names: dict[str, dict[str, DefinedNameInfo]] = {}
+        for dn in self.defined_names:
+            if dn.scope is None:
+                global_names.setdefault(dn.name, dn)
+            else:
+                local_names.setdefault(dn.scope, {})[dn.name] = dn
+        return global_names, local_names
+
+    @staticmethod
+    def _qualify_ref(ref: RawRef, default_sheet: str | None) -> RawRef:
+        if ref.sheet is not None:
+            return ref
+        return RawRef(default_sheet, ref.kind, ref.col1, ref.row1,
+                      ref.col2, ref.row2, ref.text)
+
+    def _resolve_name(
+        self,
+        token: RawName,
+        owner_sheet: str,
+        global_names: dict[str, DefinedNameInfo],
+        local_names: dict[str, dict[str, DefinedNameInfo]],
+    ) -> DefinedNameInfo | None:
+        """按 Excel 作用域规则解析名称。
+
+        - 裸名称：先取公式所在工作表的工作表级同名名称，再回退工作簿级；
+        - `工作表!名称`：限定名优先取该工作表的局部名，再回退工作簿级。
+        """
+        if token.sheet is not None:
+            hit = local_names.get(token.sheet, {}).get(token.name)
+            return hit if hit is not None else global_names.get(token.name)
+        hit = local_names.get(owner_sheet, {}).get(token.name)
+        return hit if hit is not None else global_names.get(token.name)
+
+    def _link_name(self, token: RawName, node: str, formula: str,
+                   owner_sheet: str, bounds, sheet_names, ws_values,
+                   global_names, local_names, seen_uses: set) -> None:
+        """处理公式中的一个名称记号：解析、登记使用记录、展开依赖边。"""
+        dn = self._resolve_name(token, owner_sheet, global_names, local_names)
+        if dn is None:
+            scope, target, status = None, None, NAME_UNDEFINED
+        else:
+            scope, target, status = dn.scope, dn.target, dn.status
+
+        key = (node, token.text, status)
+        if key not in seen_uses:
+            seen_uses.add(key)
+            self.name_uses.append(
+                NameUse(node, formula, token.name, token.sheet,
+                        token.text, scope, target, status)
+            )
+
+        if status != NAME_OK:
+            return  # 无法解析 / 目标无效：不产生任何边，不进入影响面
+
+        # 名称定义里未限定工作表的引用，工作簿级名称归属公式所在表
+        for ref in dn.refs:
+            sheet = ref.sheet if ref.sheet is not None else owner_sheet
+            fixed = ref if ref.sheet == sheet else self._qualify_ref(ref, sheet)
+            self._expand_and_link(fixed, node, formula, bounds,
+                                  sheet_names, ws_values)
+
+    # ------------------------------------------------------------- 边展开
+    def _link_ref(self, ref: RawRef, node: str, formula: str, owner_sheet: str,
+                  bounds, sheet_names, ws_values) -> None:
+        """处理公式中的一条直接引用。"""
+        target_sheet = ref.sheet if ref.sheet is not None else owner_sheet
+        fixed = ref if ref.sheet is not None else self._qualify_ref(ref, owner_sheet)
+        if target_sheet not in sheet_names:
+            self.missing_sheet_refs.append(
+                MissingSheetRef(node, formula, target_sheet, ref.text)
+            )
+            return  # 引用不存在的工作表，跳过
+        self._expand_and_link(fixed, node, formula, bounds, sheet_names, ws_values)
+
+    def _expand_and_link(self, ref: RawRef, node: str, formula: str,
+                         bounds, sheet_names, ws_values) -> None:
+        """展开 RawRef（其 sheet 必须为现存工作表）并登记依赖边。"""
+        target_sheet = ref.sheet
+        wst = ws_values.get(target_sheet)
+        coords, out_coord = self._expand(ref, bounds[target_sheet])
+        if out_coord is not None:
+            self.out_of_range_refs.append(
+                OutOfRangeRef(node, formula, target_sheet, ref.text, out_coord)
+            )
+        for tcoord in coords:
+            tnode = node_id(target_sheet, tcoord)
+            g_prec = self.precedents.setdefault(node, set())
+            if tnode not in g_prec:
+                g_prec.add(tnode)
+                self.dependents.setdefault(tnode, set()).add(node)
+                self.edge_count += 1
+            # 叶子单元格也记录值，便于前端展示
+            if tnode not in self.formulas and tnode not in self.values and wst is not None:
+                v = wst[tcoord].value
+                if v is not None:
+                    self.values[tnode] = str(v)
 
     @staticmethod
     def _expand(
@@ -340,12 +538,15 @@ class WorkbookGraph:
         """扫描依赖图，生成依赖健康问题清单。
 
         问题类型：
-          missing_sheet   error   跨表公式指向不存在的工作表
-          empty_ref       warning 被公式引用却为空的单元格
-          out_of_range    warning 引用超出目标工作表的已用范围
-          high_fanout     warning 公式直接引用的单元格数超过阈值
-          orphan_formula  info    未被任何公式引用的公式单元格
-        sheet 筛选按问题所属工作表（缺失工作表类按公式所在工作表）。
+          missing_sheet       error   跨表公式指向不存在的工作表
+          undefined_name      error   公式中的定义名称按作用域无法解析
+          invalid_name_target error   定义名称目标损坏（#REF! / 外部工作簿）或
+                                       指向不存在的工作表
+          empty_ref           warning 被公式引用却为空的单元格
+          out_of_range        warning 引用超出目标工作表的已用范围
+          high_fanout         warning 公式直接引用的单元格数超过阈值
+          orphan_formula      info    未被任何公式引用的公式单元格
+        sheet 筛选按问题所属工作表（名称 / 缺失工作表类按公式所在工作表）。
         """
         issues: list[dict] = []
 
@@ -379,6 +580,67 @@ class WorkbookGraph:
                 "target_sheet": m.sheet,
                 "target_display": m.ref_text,
                 "evidence": [self._edge(m.source, None, m.ref_text, m.ref_text)],
+            })
+
+        # 1b) 名称管理器：无法解析 / 目标无效的名称使用（每处使用一条，可定位）
+        def _scope_label(scope: str | None) -> str:
+            return "工作簿级" if scope is None else f"工作表级（{scope}）"
+
+        for u in self.name_uses:
+            if u.status not in NAME_UNRESOLVED_STATES:
+                continue
+            owner = split_node(u.source)[0]
+            if u.qualifier:
+                q = u.qualifier
+                qualifier = f"{q}!" if q.replace("_", "").isalnum() else f"'{q}'!"
+            else:
+                qualifier = ""
+            name_display = f"{qualifier}{u.name}"
+            if u.status == NAME_UNDEFINED:
+                code = "undefined_name"
+                scope_hint = (
+                    f"{_scope_label(owner)}同名名称" if u.qualifier is None
+                    else f"工作表 {u.qualifier!r} 的工作表级或工作簿级同名名称"
+                )
+                message = (f"名称 {u.name!r} 无法解析：工作簿中不存在"
+                           f"{scope_hint}（记号 {name_display}）")
+                target_display = None
+            else:
+                code = "invalid_name_target"
+                # missing_sheet 时 target 中的缺失工作表名
+                missing = next(
+                    (r.sheet for dn in self.defined_names
+                     if dn.name == u.name and dn.scope == u.scope
+                     for r in dn.refs if r.sheet not in {s.name for s in self.sheets}),
+                    None,
+                )
+                if u.status == NAME_MISSING_SHEET:
+                    reason = f"名称定义指向不存在的工作表 {missing!r}"
+                elif (u.target or "").upper().find("#REF!") >= 0:
+                    reason = "名称定义为损坏的 #REF! 引用"
+                elif (u.target or "").lstrip().startswith("["):
+                    reason = "名称定义指向外部工作簿，本文件内无法定位"
+                else:
+                    reason = "名称定义为空或无法解析"
+                message = (f"名称 {u.name!r} 的定义无效：{reason}"
+                           f"（{_scope_label(u.scope)}，定义为 {u.target!r}）")
+                target_display = u.target
+            add({
+                "code": code,
+                "level": "error",
+                "sheet": owner,
+                "cell": u.source,
+                "cell_display": display_id(owner, split_node(u.source)[1]),
+                "message": message,
+                "formula": u.formula,
+                "name": u.name,
+                "name_display": name_display,
+                "name_scope": u.scope,
+                "name_qualifier": u.qualifier,
+                "name_target": u.target,
+                "name_status": u.status,
+                "target_display": target_display,
+                "evidence": [self._edge(u.source, None, target_display, u.text)],
             })
 
         # 2) 显式引用超出目标工作表的已用范围
@@ -501,10 +763,64 @@ class WorkbookGraph:
             "formula_count": len(self.formulas),
             "edge_count": self.edge_count,
             "cycle_count": len(self.cycles),
+            "defined_name_count": len(self.defined_names),
             "cycles": [
                 [display_id(*split_node(n)) for n in cyc] for cyc in self.cycles
             ],
         }
+
+    def defined_names_export(self) -> dict:
+        """名称管理器的完整解析结果：定义清单 + 公式中的使用与解析状态。"""
+        sheet_names = {s.name for s in self.sheets}
+
+        def ref_texts(dn: DefinedNameInfo) -> list[dict]:
+            out = []
+            for r in dn.refs:
+                out.append({
+                    "ref": r.text,
+                    "sheet": r.sheet,
+                    "sheet_exists": r.sheet in sheet_names,
+                    "kind": r.kind,
+                })
+            return out
+
+        return {
+            "definitions": [
+                {
+                    "name": dn.name,
+                    "scope": dn.scope,
+                    "scope_label": "工作簿级" if dn.scope is None else f"工作表级（{dn.scope}）",
+                    "target": dn.target,
+                    "status": dn.status,
+                    "refs": ref_texts(dn),
+                }
+                for dn in sorted(self.defined_names,
+                                 key=lambda d: (d.scope is None, d.scope or "", d.name))
+            ],
+            "uses": [
+                {
+                    "source": u.source,
+                    "source_display": display_id(*split_node(u.source)),
+                    "formula": u.formula,
+                    "name": u.name,
+                    "name_display": u.text,
+                    "qualifier": u.qualifier,
+                    "scope": u.scope,
+                    "target": u.target,
+                    "status": u.status,
+                    "resolved": u.status == NAME_OK,
+                }
+                for u in self.name_uses
+            ],
+            "counts_by_status": self._name_status_counts(),
+        }
+
+    def _name_status_counts(self) -> dict[str, int]:
+        counts = {NAME_OK: 0, NAME_CONSTANT: 0, NAME_UNDEFINED: 0,
+                  NAME_BAD_TARGET: 0, NAME_MISSING_SHEET: 0}
+        for u in self.name_uses:
+            counts[u.status] = counts.get(u.status, 0) + 1
+        return counts
 
     def cell_list(
         self,
@@ -566,5 +882,6 @@ class WorkbookGraph:
             "cycles": [
                 [display_id(*split_node(n)) for n in cyc] for cyc in self.cycles
             ],
+            "defined_names": self.defined_names_export(),
             "audit": self.audit(evidence_limit=None),
         }

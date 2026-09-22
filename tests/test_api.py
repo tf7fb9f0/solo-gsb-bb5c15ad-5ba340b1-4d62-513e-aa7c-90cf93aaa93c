@@ -192,3 +192,59 @@ def test_full_export_includes_audit():
     wid = r.json()["workbook_id"]
     d = client.get(f"/api/workbooks/{wid}/export").json()
     assert "audit" in d and "issues" in d["audit"]
+
+
+def make_names_xlsx() -> bytes:
+    from openpyxl.workbook.defined_name import DefinedName
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "S1"
+    ws["A1"] = 10
+    ws["B1"] = "=税率*2"                 # 工作簿级名称 -> S1!A1
+    ws["B2"] = "=本地名+1"               # 工作表级名称 -> S1!A1
+    ws["B3"] = "=坏名+1"                 # #REF!
+    ws["B4"] = "=没定义的名称+1"         # 未定义
+    wb.defined_names.add(DefinedName("税率", attr_text="S1!$A$1"))
+    wb.defined_names.add(DefinedName("坏名", attr_text="#REF!"))
+    ws.defined_names.add(DefinedName("本地名", attr_text="S1!$A$1"))
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_names_upload_audit_and_export():
+    r = client.post("/api/upload", files={"file": ("n.xlsx", make_names_xlsx(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    assert r.status_code == 200
+    d = r.json()
+    wid = d["workbook_id"]
+    assert d["defined_name_count"] == 3
+
+    # 名称解析出的边参与影响面
+    imp = client.get(f"/api/workbooks/{wid}/impact",
+                     params={"cell": "S1!A1"}).json()
+    cells = {i["cell"] for i in imp["impacted"]}
+    assert {"S1!B1", "S1!B2"} <= cells
+
+    audit = client.get(f"/api/workbooks/{wid}/audit").json()
+    codes = {i["code"] for i in audit["issues"]}
+    assert "undefined_name" in codes and "invalid_name_target" in codes
+    bad = next(i for i in audit["issues"] if i["code"] == "invalid_name_target")
+    assert bad["cell"] == "S1!B3" and bad["name"] == "坏名"
+    assert bad["name_target"] == "#REF!"
+    # 无效名称不产生影响面目标
+    assert "S1!B3" not in cells
+
+    export = client.get(f"/api/workbooks/{wid}/export").json()
+    assert "defined_names" in export
+    names = {(d["scope"], d["name"]): d for d in export["defined_names"]["definitions"]}
+    assert names[(None, "税率")]["status"] == "ok"
+    assert names[("S1", "本地名")]["scope"] == "S1"
+    statuses = {u["name"]: u["status"] for u in export["defined_names"]["uses"]}
+    assert statuses["税率"] == "ok"
+    assert statuses["坏名"] == "bad_target"
+    assert statuses["没定义的名称"] == "undefined"
+
+    # 审计导出同样保留名称段
+    aexport = client.get(f"/api/workbooks/{wid}/audit/export").json()
+    assert "defined_names" in aexport and aexport["defined_names"]["uses"]

@@ -116,6 +116,7 @@
   <span class="stat">工作表<b id="stSheets"></b></span>
   <span class="stat">公式单元格<b id="stFormulas"></b></span>
   <span class="stat">依赖边<b id="stEdges"></b></span>
+  <span class="stat">定义名称<b id="stNames"></b></span>
   <span class="stat cycles">循环引用<b id="stCycles"></b></span>
   <span class="stat cycles">审计问题<b id="stAudit">—</b></span>
 </div>
@@ -144,7 +145,7 @@
         <div class="filters-row">
           <select id="auditLevel">
             <option value="">全部级别</option>
-            <option value="error">错误（缺失工作表）</option>
+            <option value="error">错误（工作表 / 名称问题）</option>
             <option value="warning">警告（空引用 / 越界 / 高扇出）</option>
             <option value="info">提示（孤立公式）</option>
           </select>
@@ -201,6 +202,8 @@ let WID = null, CURRENT = null, DIRECTION = 'downstream', AUDIT_SUMMARY = null;
 const LEVEL_LABEL = { error: '错误', warning: '警告', info: '提示' };
 const CODE_LABEL = {
   missing_sheet: '工作表不存在',
+  undefined_name: '名称无法解析',
+  invalid_name_target: '名称定义无效',
   empty_ref: '引用了空单元格',
   out_of_range: '引用超出已用范围',
   high_fanout: '扇出过大',
@@ -252,6 +255,7 @@ function onUploaded(d) {
   $('stSheets').textContent = d.sheets.length;
   $('stFormulas').textContent = d.formula_count;
   $('stEdges').textContent = d.edge_count;
+  $('stNames').textContent = d.defined_name_count ?? 0;
   $('stCycles').textContent = d.cycle_count;
   $('exportBtn').disabled = false;
   $('auditBtn').disabled = false;
@@ -395,7 +399,10 @@ function renderAuditSummary(d) {
   pill.className = d.total === 0 ? 'zero' : '';
   pill.style.display = 'inline-block';
   const codeNames = {
-    missing_sheet: '工作表不存在', empty_ref: '引用空单元格',
+    missing_sheet: '工作表不存在',
+    undefined_name: '名称无法解析',
+    invalid_name_target: '名称定义无效',
+    empty_ref: '引用空单元格',
     out_of_range: '越界引用', high_fanout: '高扇出', orphan_formula: '孤立公式',
   };
   $('auditCounts').innerHTML =
@@ -459,7 +466,10 @@ async function loadAudit() {
       </td>
       <td>
         <div>${esc(it.message)}</div>
-        ${it.target_display ? `<div class="path" style="margin:3px 0">目标：${esc(it.target_display)}</div>` : ''}
+        ${it.name_display ? `<div class="path" style="margin:3px 0">名称：<b>${esc(it.name_display)}</b>` +
+            (it.name_scope ? `（工作表级 · ${esc(it.name_scope)}）` : '（工作簿级）') +
+            (it.name_target ? ` → ${esc(it.name_target)}` : '') + `</div>` : ''}
+        ${it.target_display && !it.name_display ? `<div class="path" style="margin:3px 0">目标：${esc(it.target_display)}</div>` : ''}
         ${it.formula ? `<div class="formula-code" style="margin:5px 0">${esc(it.formula)}</div>`
                      : ''}
         ${it.evidence.length || it.evidence_truncated ? renderEvidence(it) : ''}
